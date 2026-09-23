@@ -1,0 +1,14 @@
+# python .gitignore
+
+venv/
+env/
+.env
+__pycache__/
+data/
+data
+# vscode .gitignore
+
+settings.json
+logs.log
+.vs/slnx.sqlite
+logs/
