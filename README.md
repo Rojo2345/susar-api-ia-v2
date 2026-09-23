@@ -82,3 +82,8 @@ SHAREPOINT_SITE = ''
 ```bash
 python -m api_susar.api_run
 ```
+
+# Video demostracion
+https://drive.google.com/file/d/1nxTC-79KYFxJQ87cGZAA3atp9RiqwCpl/view?usp=sharing
+
+
