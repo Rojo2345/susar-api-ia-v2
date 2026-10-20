@@ -1,3 +1,4 @@
+
 import os
 import tempfile
 import uuid
@@ -10,7 +11,6 @@ logger = setup_daily_logger()
 
 
 def _clean_value(value: Any) -> Any:
-    """Campos faltantes se envían vacíos para mantener compatibilidad externa."""
     if value is None:
         return ""
     if isinstance(value, str):
@@ -29,20 +29,8 @@ def _missing_fields(selected: Dict[str, Any]) -> list:
     return [label for key, label in fields.items() if not selected.get(key)]
 
 
-def _missing_fields(selected: Dict[str, Any]) -> list:
-    fields = {
-        "reporte": "Reporte",
-        "id_reporte": "Id del reporte",
-        "fecha_reporte": "Fecha del reporte",
-        "pais": "País",
-        "tipo": "Tipo",
-    }
-    return [label for key, label in fields.items() if not selected.get(key)]
-
-
 def convertir_a_formato_api_original(resultado_demo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     selected = resultado_demo.get("selected_result") or resultado_demo.get("heuristics") or {}
-
     tipo = _clean_value(selected.get("tipo"))
     if isinstance(tipo, str):
         tipo = tipo.upper()
@@ -53,23 +41,16 @@ def convertir_a_formato_api_original(resultado_demo: Dict[str, Any]) -> Dict[str
         "Fecha del reporte": _clean_value(selected.get("fecha_reporte")),
         "País": _clean_value(selected.get("pais")),
     }
-
     if tipo in {"INITIAL", "FOLLOWUP"}:
         page_result[tipo] = tipo
-
     return {"page_1": page_result}
 
 
-def procesar_pdf_con_demo(
-    file_storage,
-    provider: str = "openai",
-    preprocess_only: bool = False,
-    debug_preprocess: bool = False,
-) -> Dict[str, Any]:
-    filename = file_storage.filename or "archivo.pdf"
+def procesar_pdf_con_demo(file_storage, provider: str = "openai",
+                          preprocess_only: bool = False,
+                          debug_preprocess: bool = False) -> Dict[str, Any]:
+    filename = os.path.basename(file_storage.filename or "archivo.pdf")
     execution_id = str(uuid.uuid4())[:8]
-    execution_id = str(uuid.uuid4())[:8]
-
     if not filename.lower().endswith(".pdf"):
         raise ValueError("El archivo debe ser PDF.")
 
@@ -92,47 +73,45 @@ def procesar_pdf_con_demo(
         )
 
         logger.info("AI status: %s", resultado_demo.get("ai_status"))
-        logger.info("Metodo seleccionado: %s", resultado_demo.get("selected_method"))
+        method = resultado_demo.get("selected_method") or "unknown"
+        logger.info("Metodo seleccionado: %s", method)
+
+        if resultado_demo.get("filled_from_heuristics"):
+            logger.warning("[%s] CAMPOS COMPLETADOS POR HEURISTICAS | %s",
+                           execution_id, resultado_demo["filled_from_heuristics"])
+
+        # No registrar CAMPO CORREGIDO POR DOCUMENTO, EVIDENCIA CIOMS ni
+        # listados auxiliares de 'corregidos'. Los WARNING/ERROR reales permanecen.
         logger.info("Resultado seleccionado: %s", resultado_demo.get("selected_result"))
+
         if resultado_demo.get("ai_error"):
-            logger.warning("Problema con proveedor IA; se conservó el resultado disponible: %s", resultado_demo["ai_error"])
+            logger.warning("Problema con proveedor IA; se conservó el resultado disponible: %s",
+                           resultado_demo["ai_error"])
 
         selected = resultado_demo.get("selected_result") or resultado_demo.get("heuristics") or {}
-        processing_status = "PARTIAL" if resultado_demo.get("selected_method") == "heuristics_fallback" else "SUCCESS"
+        missing = _missing_fields(selected)
+        fallback = method.startswith("heuristics_fallback")
+        partial = bool(fallback or missing)
+        processing_status = "PARTIAL" if partial else "SUCCESS"
 
-        logger.info(
-            "[%s] FINAL STATUS=%s | method=%s | missing_fields=%s",
-            execution_id,
-            processing_status,
-            resultado_demo.get("selected_method"),
-            _missing_fields(selected),
-        )
+        logger.info("[%s] FINAL STATUS=%s | method=%s | missing_fields=%s",
+                    execution_id, processing_status, method, missing)
 
-        selected = resultado_demo.get("selected_result") or resultado_demo.get("heuristics") or {}
-
-        if resultado_demo.get("selected_method") == "heuristics_fallback":
-            logger.warning(
-                "[%s] RESULTADO PARCIAL POR HEURÍSTICAS | campos_faltantes=%s | motivo=%s",
-                execution_id,
-                _missing_fields(selected),
-                resultado_demo.get("ai_error"),
-            )
+        if fallback:
+            logger.warning("[%s] RESULTADO PARCIAL POR HEURISTICAS | campos_faltantes=%s | motivo=%s",
+                           execution_id, missing, resultado_demo.get("ai_error"))
+        elif missing:
+            logger.warning("[%s] RESULTADO INCOMPLETO | campos_faltantes=%s",
+                           execution_id, missing)
         else:
-            logger.info("[%s] RESULTADO COMPLETO IA | metodo=%s", execution_id, resultado_demo.get("selected_method"))
+            logger.info("[%s] RESULTADO COMPLETO IA | metodo=%s", execution_id, method)
 
-        logger.info(
-            "[%s] EXTRACCION FINAL | id=%s | fecha=%s | pais=%s | reporte=%s | tipo=%s",
-            execution_id,
-            selected.get("id_reporte", ""),
-            selected.get("fecha_reporte", ""),
-            selected.get("pais", ""),
-            selected.get("reporte", ""),
-            selected.get("tipo", ""),
-        )
+        logger.info("[%s] EXTRACCION FINAL | id=%s | fecha=%s | pais=%s | reporte=%s | tipo=%s",
+                    execution_id, selected.get("id_reporte", ""),
+                    selected.get("fecha_reporte", ""), selected.get("pais", ""),
+                    selected.get("reporte", ""), selected.get("tipo", ""))
 
         response = convertir_a_formato_api_original(resultado_demo)
-
-        # Modo de prueba: entrega además lo ocurrido antes de OpenAI.
         if debug_preprocess:
             response["debug_pre_openai"] = {
                 "ocr_status": resultado_demo.get("ocr_status"),
@@ -145,7 +124,9 @@ def procesar_pdf_con_demo(
 
         logger.info("Respuesta API: %s", response)
         return response
-
+    except Exception:
+        logger.exception("[%s] ERROR procesando archivo %s", execution_id, filename)
+        raise
     finally:
         try:
             os.remove(temp_path)

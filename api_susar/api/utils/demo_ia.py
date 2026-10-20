@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, Tuple, List, Union
 from PIL import Image
 from api_susar.api_utilities import PYTESERRACT_PATH
 
+
 # -------------------------
 # Regex / Heuristicas
 # -------------------------
@@ -22,7 +23,7 @@ COUNTRY_RE = re.compile(
 PV_RE = re.compile(r"\bPV\d{8,}\b", re.IGNORECASE)
 
 REPORT_ID_RE = re.compile(
-    r"\b(?:PV\d{8,}|[A-Z]{2}-\d{6,}-\d{4,})\b",
+    r"(?:\b20\d{2}-\d{4,9}\(\d{1,4}\)(?!\w)|\bPV\d{8,}\b|\b[A-Z]{2}-\d{6,}-\d{4,}\b)",
     re.IGNORECASE
 )
 
@@ -146,26 +147,34 @@ def try_ocr_multi(images: List[Image.Image], max_pages_ocr: int = 3) -> Tuple[Op
     return None, "tesseract_error"
 
 def normalizar(s: str) -> Optional[str]:
+    """Normaliza fechas verificables; nunca construye una fecha imposible."""
     if not s:
         return None
-    s = s.strip()
-
-    # dd-MMM-yyyy (04-Dec-2025)
-    m = re.search(r"\b(\d{1,2})[-/ ]([A-Za-z]{3,4})[-/ ](\d{4})\b", s)
-    if m:
-        d = int(m.group(1))
-        mon = m.group(2).upper()[:3]
-        y = m.group(3)
-        return f"{d:02d}-{mon}-{y}"
-
-    # dd/mm/yyyy or dd-mm-yyyy
-    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", s)
-    if m:
-        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        mon_map = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"]
-        if 1 <= mo <= 12:
-            return f"{d:02d}-{mon_map[mo-1]}-{y}"
-    return None
+    from datetime import date
+    months = {
+        "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
+    }
+    value = s.strip()
+    parsed = re.search(r"\b(\d{1,2})\s*[-/ ]\s*([A-Za-z]{3,9}|\d{1,2})\s*[-/ ]\s*(\d{4})\b", value)
+    if not parsed:
+        return None
+    day, token, year = parsed.groups()
+    token = token.upper()
+    if token.isdigit():
+        month = int(token)
+    else:
+        # Nombres completos en inglés (September), abreviaturas SEP/SEPT.
+        month = months.get(token[:3])
+        if token == "SEPT":
+            month = 9
+    if not month:
+        return None
+    try:
+        result = date(int(year), month, int(day))
+    except ValueError:
+        return None
+    return f"{result.day:02d}-{list(months)[result.month - 1]}-{result.year:04d}"
 
 def _clean_ocr_text(text: str) -> str:
     """Normaliza espacios y saltos sin destruir la estructura por líneas."""
@@ -176,120 +185,100 @@ def _clean_ocr_text(text: str) -> str:
 
 
 def _valid_report_id_candidate(value: str) -> bool:
-    """Valida candidatos de ID de reporte."""
+    """Acepta identificadores de caso, pero no códigos postales ni etiquetas."""
     if not value:
         return False
-
     value = value.strip().upper().rstrip(".,;:")
-    if len(value) < 6:
+    # ZIP+4 precedido de estado, p. ej. NJ-08543-4000, no es ID SUSAR.
+    if re.fullmatch(r"[A-Z]{2}-\d{5}-\d{4}", value):
         return False
-
-    # Debe tener letras y números
-    if not re.search(r"[A-Z]", value):
-        return False
-    if not re.search(r"\d", value):
-        return False
-
-    # Evitar fechas/campos que OCR pueda capturar
-    invalid = [
-        "DATE",
-        "REPORT",
-        "STUDY",
-        "PATIENT",
-        "CENTER",
-        "NUMBER",
-    ]
-    if any(x in value for x in invalid):
-        return False
-
-    return True
+    # En los CIOMS de este lote 24b contiene IDs como 2025-100830(1).
+    # No exigir letras: esa validación antigua descartaba el ID correcto.
+    if re.fullmatch(r"20\d{2}-\d{4,9}\(\d{1,4}\)", value):
+        return True
+    if re.fullmatch(r"PV\d{8,}(?:-\d+)*", value):
+        return True
+    if re.fullmatch(r"[A-Z]{2,10}-\d{5,}(?:-\d{3,})+", value):
+        return True
+    if re.fullmatch(r"[A-Z]{2,10}-\d{8,}", value):
+        return True
+    if re.fullmatch(r"20\d{2}-AER-\d{4,}(?:-\d+)*", value):
+        return True
+    return False
 
 
 def _extract_report_id(text: str) -> Optional[str]:
+    """Prioriza 24b. MFR CONTROL NO.; nunca ID de direcciones postales.
+
+    Con etiqueta presente pero valor ininteligible: devolver None, en vez de
+    seleccionar un código de la carta de presentación por su longitud.
     """
-    Extrae el ID más completo posible.
-
-    Prioridad:
-    1) Campos explícitos CIOMS (Worldwide UID, MFR Control, Case number)
-    2) Candidatos generales
-    3) Si hay varios candidatos válidos, gana el más largo
-    """
-    candidates = []
-
-    labeled_patterns = [
-        # Worldwide UID - CN-009507513-2328416
-        r"WORLDWIDE\s+UID\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]+)",
-        # MFR CONTROL NO. CN-009507513-2328416
-        r"MFR\.?\s*CONTROL\s*NO\.?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]+)",
-        r"CONTROL\s*NO\.?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]+)",
-        # Case number: CN-009507513-2328416
-        r"CASE\s+NUMBER\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-/]+)",
-        r"SUSPECT\s+ADVERSE\s+REACTION\s+REPORT\s*\n\s*([A-Z0-9][A-Z0-9\-/]+)",
-    ]
-
-    for pattern in labeled_patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            candidate = match.group(1).strip().upper().rstrip(".,;:")
-            if _valid_report_id_candidate(candidate):
-                candidates.append(candidate)
-
-    general_patterns = [
-        r"\b\d{4}-AER-\d{4,}(?:-\d+)*\b",
-        r"\bPV\d{8,}(?:-\d+)*\b",
-        r"\b[A-Z]{2,10}-\d+(?:-\d+)+\b",
-        r"\b[A-Z]{2,10}-\d{5,}\b",
-    ]
-
-    for pattern in general_patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            candidate = match.group(0).strip().upper()
-            if _valid_report_id_candidate(candidate):
-                candidates.append(candidate)
-
-    if not candidates:
-        return None
-
-    # Eliminar duplicados y quedarse con el ID más informativo.
-    candidates = list(set(candidates))
-    return max(candidates, key=len)
-
+    labeled = (
+        r"24\s*b\s*\.\s*MFR\s+CONTROL\s+NO\.?",
+        r"\bMFR\s+CONTROL\s+NO\.?",
+        r"\bWORLDWIDE\s+UID\b",
+    )
+    for label in labeled:
+        for match in re.finditer(label, text, re.I):
+            tail = text[match.end():match.end() + 135]
+            # Los tokens normalmente están en la línea siguiente, a veces con
+            # espacios en blanco de formulario entre etiqueta y valor.
+            for line in tail.splitlines()[:4]:
+                line = line.strip().lstrip(":- ").strip()
+                if not line:
+                    continue
+                found = re.match(
+                    r"(20\d{2}-\d{4,9}\(\d{1,4}\)|"
+                    r"20\d{2}-AER-\d{4,}(?:-\d+)*|"
+                    r"PV\d{8,}(?:-\d+)*|"
+                    r"[A-Z]{2,10}-\d{5,}(?:-\d{3,})+|"
+                    r"[A-Z]{2,10}-\d{8,})", line, re.I)
+                if found and _valid_report_id_candidate(found.group(1)):
+                    return found.group(1).upper()
+                # Al llegar a otro número de campo, dejar de leer este bloque.
+                if re.match(r"\d{1,2}[a-d]?\s*\.\s*[A-Z]", line, re.I):
+                    break
+    # Respaldo: SOLO si existe un único identificador de caso inequívoco.
+    # Un código postal tipo NJ-08543-4000 no cumple el patrón de caso.
+    found = set()
+    for expression in (r"\b20\d{2}-\d{4,9}\(\d{1,4}\)",
+                       r"\b20\d{2}-AER-\d{4,}(?:-\d+)*\b",
+                       r"\bPV\d{8,}(?:-\d+)*\b"):
+        found.update(m.group(0).upper() for m in re.finditer(expression, text, re.I))
+    return next(iter(found)) if len(found) == 1 else None
 
 def _extract_country(text: str) -> Optional[str]:
+    """Toma país solo de 1a. COUNTRY; admite hojas de continuación.
+
+    No inferir país desde el fabricante, el identificador o una dirección.
+    """
     aliases = {
-        "CHILE": "CHILE",
-        "CHINA": "CHINA",
-        "ARGENTINA": "ARGENTINA",
-        "BRAZIL": "BRAZIL",
-        "BRASIL": "BRAZIL",
-        "PERU": "PERU",
-        "PERÚ": "PERU",
-        "COLOMBIA": "COLOMBIA",
-        "MEXICO": "MEXICO",
-        "MÉXICO": "MEXICO",
+        "USA": "UNITED STATES OF AMERICA", "U.S.A.": "UNITED STATES OF AMERICA",
+        "UNITED STATES": "UNITED STATES OF AMERICA",
         "UNITED STATES OF AMERICA": "UNITED STATES OF AMERICA",
-        "UNITED STATES": "UNITED STATES",
-        "USA": "UNITED STATES",
+        "UNITED KINGDOM OF GREAT BRITAIN AND NORTHERN IRELAND": "UNITED KINGDOM",
+        "UK": "UNITED KINGDOM", "UNITED KINGDOM": "UNITED KINGDOM",
+        "BRASIL": "BRAZIL", "MÉXICO": "MEXICO", "PERÚ": "PERU",
     }
-    values = sorted(aliases, key=len, reverse=True)
-    country_union = "|".join(re.escape(v) for v in values)
-
-    # Prioriza el campo del paciente para evitar capturar la dirección del fabricante.
-    patterns = [
-        rf"(?:1a\.?\s*)?COUNTRY\s*[:\-]?\s*(?:\n\s*)?({country_union})\b",
-        rf"PA[IÍ]S\s*[:\-]?\s*(?:\n\s*)?({country_union})\b",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, re.IGNORECASE)
-        if m:
-            return aliases.get(m.group(1).upper(), m.group(1).upper())
-
-    # Fallback limitado a la parte inicial de la primera página.
-    head = text[:2500]
-    for value in values:
-        if re.search(rf"\b{re.escape(value)}\b", head, re.IGNORECASE):
-            return aliases[value]
+    bad = {"UNITED", "CONT", "CONT.", "CONT..", "UNKNOWN", "MASKED",
+           "N/A", "NOT KNOWN", "NOT AVAILABLE", "NOT REPORTED"}
+    # Buscar TODAS las apariciones: un país partido puede estar completo en
+    # la hoja de continuación, incluso si la primera aparición dice UNITED.
+    for m in re.finditer(r"(?:^|\n)\s*1a\s*\.\s*COUNTRY\s*:?[ \t]*", text, re.I):
+        tail = text[m.end():m.end() + 110]
+        for line in tail.splitlines()[:3]:
+            value = re.sub(r"\s+", " ", line).strip(" .:-\t").upper()
+            if not value:
+                continue
+            if value in bad or re.match(r"\d+[a-d]?\.\s", value):
+                break
+            if not (2 <= len(value) <= 85 and
+                    re.fullmatch(r"[A-ZÀ-Ÿ][A-ZÀ-Ÿ .'-]*", value)):
+                break
+            if re.search(r"(?:CONTINUATION|REPORT|REACTION|MANUFACTURER|PATIENT|COUNTRY)", value):
+                break
+            return aliases.get(value, value)
     return None
-
 
 def _date_score(text: str, start: int, end: int, label: str) -> float:
     """
@@ -312,138 +301,42 @@ def _date_score(text: str, start: int, end: int, label: str) -> float:
 
 
 def _extract_report_date(text: str) -> Optional[str]:
+    """Solo DATE OF THIS REPORT, nunca DATE RECEIVED ni fechas clínicas.
+
+    No adivinar con la primera fecha del documento; en el lote anterior
+    ese comportamiento capturaba fechas de cartas o del evento adverso.
     """
-    Extrae la fecha principal del CIOMS.
-
-    Prioridad:
-    1) Fecha dentro de la sección de cabecera del reporte.
-    2) DATE OF THIS REPORT.
-    3) REPORT DATE.
-    4) DATE RECEIVED BY MANUFACTURER.
-    5) fallback general.
-
-    Se evita tomar fechas de tratamientos, eventos o antecedentes.
-    """
-
-    date_token = (
-        r"\d{1,2}\s*[-/]\s*"
-        r"(?:JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|"
-        r"JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)"
-        r"\s*[-/]\s*\d{4}"
-        r"|\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{4}"
-    )
-
-    candidates = []
-
-    # Bloque superior del CIOMS. Normalmente contiene:
-    # Date of this report + Report type.
-    header_blocks = re.findall(
-        r"(?:DATE\s+OF\s+THIS\s+REPORT|25A\.\s*REPORT\s+TYPE|REPORT\s+TYPE)"
-        r"[\s\S]{0,250}",
-        text,
-        re.IGNORECASE,
-    )
-
-    for block in header_blocks:
-        for m in re.finditer(date_token, block, re.IGNORECASE):
-            value = normalizar(m.group(0))
-            if value:
-                candidates.append({
-                    "date": value,
-                    "score": 200,
-                    "source": "header_block",
-                })
-
-    # Etiqueta explícita DATE OF THIS REPORT.
-    for label in [
-        r"DATE\s+OF\s+THIS\s+REPORT",
-        r"REPORT\s+DATE",
-        r"FECHA\s+DEL\s+REPORTE",
-    ]:
-        for m in re.finditer(label, text, re.IGNORECASE):
-            start = max(0, m.start() - 120)
-            end = min(len(text), m.end() + 120)
-            block = text[start:end]
-
-            for date_match in re.finditer(date_token, block, re.IGNORECASE):
-                value = normalizar(date_match.group(0))
-                if value:
-                    candidates.append({
-                        "date": value,
-                        "score": 150,
-                        "source": label,
-                    })
-
-    # Fecha recibida por fabricante solo como respaldo.
-    for label in [
-        r"DATE\s+RECEIVED\s+BY\s+MANUFACTURER",
-        r"RECEIPT\s+DATE",
-    ]:
-        for m in re.finditer(label, text, re.IGNORECASE):
-            start = max(0, m.start() - 80)
-            end = min(len(text), m.end() + 80)
-            block = text[start:end]
-
-            for date_match in re.finditer(date_token, block, re.IGNORECASE):
-                value = normalizar(date_match.group(0))
-                if value:
-                    candidates.append({
-                        "date": value,
-                        "score": 50,
-                        "source": label,
-                    })
-
-    if candidates:
-        # La fecha de cabecera siempre gana.
-        best = max(candidates, key=lambda x: x["score"])
-        return best["date"]
-
-    # Último fallback.
-    m = re.search(rf"\b({date_token})\b", text, re.IGNORECASE)
-    return normalizar(m.group(1)) if m else None
-
-
-def _extract_report_type(text: str) -> Optional[str]:
-    """Evita escoger INITIAL solo porque aparece antes en la plantilla."""
-    upper = text.upper()
-    compact = re.sub(r"[ \t]+", " ", upper)
-
-    checked = r"(?:\[\s*[X✓✔]\s*\]|[☒✓✔]|\bX\b)"
-    followup_checked = [
-        rf"{checked}\s*FOLLOW[\s-]?UP",
-        rf"FOLLOW[\s-]?UP\s*{checked}",
-    ]
-    initial_checked = [
-        rf"{checked}\s*INITIAL",
-        rf"INITIAL\s*{checked}",
-    ]
-    for pattern in followup_checked:
-        if re.search(pattern, compact, re.IGNORECASE):
-            return "FOLLOWUP"
-    for pattern in initial_checked:
-        if re.search(pattern, compact, re.IGNORECASE):
-            return "INITIAL"
-
-    # En muchos CIOMS el OCR no conserva la marca de la casilla. La narrativa sí
-    # suele declarar explícitamente que se trata de un follow-up.
-    followup_evidence = [
-        r"\bTHIS\s+(?:IS\s+)?(?:AN?\s+)?FOLLOW[\s-]?UP\s+REPORT\b",
-        r"\bFOLLOW[\s-]?UP\s*\(\d{1,2}[A-Z]{3}\d{4}\)",
-        r"\bAMENDMENT:\s*THIS\s+FOLLOW[\s-]?UP\s+REPORT\b",
-        r"\bUPDATED\s+INFORMATION\b",
-    ]
-    if any(re.search(p, upper, re.IGNORECASE) for p in followup_evidence):
-        return "FOLLOWUP"
-
-    initial_evidence = [
-        r"\bTHIS\s+(?:IS\s+)?(?:AN?\s+)?INITIAL\s+REPORT\b",
-        r"\bFIRST\s+(?:SAE\s+)?REPORT\s+WAS\s+SUBMITTED\b",
-    ]
-    if any(re.search(p, upper, re.IGNORECASE) for p in initial_evidence):
-        return "INITIAL"
-
+    # Permite valores dd/MMM/yyyy, dd-MMM-yyyy o dd/mm/yyyy.
+    date_token = (r"\d{1,2}\s*[-/]\s*"
+                  r"(?:[A-Za-z]{3,9}|\d{1,2})\s*[-/]\s*\d{4}")
+    for label in (r"\bDATE\s+OF\s+THIS\s+REPORT\b",):
+        for match in re.finditer(label, text, re.I):
+            tail = text[match.end():match.end() + 100]
+            # La etiqueta suele estar en línea distinta; no entrar a 25a.
+            tail = re.split(r"(?:25a\.|REPORT\s+TYPE|24[cd]\.)", tail, maxsplit=1, flags=re.I)[0]
+            candidate = re.search(date_token, tail, re.I)
+            if candidate:
+                normalized = normalizar(candidate.group(0))
+                if normalized:
+                    return normalized
     return None
 
+def _extract_report_type(text: str) -> Optional[str]:
+    """Devuelve tipo solo con marca textual visible dentro del campo 25a.
+
+    Normalmente un PDF conserva dos etiquetas sin indicar cuál está marcada;
+    en ese caso devolver None. La validación visual del CIOMS decide.
+    """
+    checked = r"(?:\[\s*[X✓✔]\s*\]|[☒✓✔])"
+    for m in re.finditer(r"25\s*a\s*\.\s*REPORT\s+TYPE", text, re.I):
+        segment = text[m.end():m.end() + 140]
+        segment = re.split(r"(?:CONTINUATION\s+ATTACHED|Page\s+\d+\s+of)",
+                           segment, maxsplit=1, flags=re.I)[0]
+        for field in ("FOLLOWUP", "INITIAL"):
+            if (re.search(rf"{checked}\s*{field}\b", segment, re.I)
+                    or re.search(rf"\b{field}\s*{checked}", segment, re.I)):
+                return field
+    return None
 
 def _valid_report_candidate(candidate: str) -> bool:
     candidate = re.sub(r"\s+", " ", candidate).strip(" :-\t")
@@ -487,36 +380,31 @@ def _report_candidate_score(candidate: str) -> float:
 
 
 def _extract_report(text: str) -> Optional[str]:
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines() if line.strip()]
-    candidates: List[str] = []
+    """Extrae únicamente el término del evento 1) en la sección 7+13.
 
-    # Prioriza la sección 7+13 de la primera página.
-    for index, line in enumerate(lines):
-        if re.search(r"(?:7\s*\+\s*13\s*)?DESCRIBE\s+REACTION\(S\)", line, re.IGNORECASE):
-            for offset in range(1, 10):
-                if index + offset >= len(lines):
-                    break
-                candidate = lines[index + offset]
-                if re.search(r"^(?:II\.|14\.)\s*SUSPECT\s+DRUG", candidate, re.IGNORECASE):
-                    break
-                if _valid_report_candidate(candidate):
-                    candidates.append(candidate)
-
-    # Formato habitual: "1) reacción (...)".
-    for line in lines:
-        if re.match(r"^\s*\d+\)\s+", line) and _valid_report_candidate(line):
-            if re.search(r"\(\d{8}\)|\b(infection|pneumonia|tuberculosis|pain|fever|rash|sepsis)\b", line, re.IGNORECASE):
-                candidates.append(line)
-
-    if not candidates:
-        return None
-
-    # Elimina duplicados conservando orden y luego puntúa.
-    unique = list(dict.fromkeys(candidates))
-    unique.sort(key=_report_candidate_score, reverse=True)
-    return unique[0]
-
-
+    Nunca elige el evento 2), la narrativa o un fármaco como sustituto.
+    """
+    for head in re.finditer(
+        r"7\s*\+\s*13\s*DESCRIBE\s+REACTION\(S\)", text, re.I):
+        tail = text[head.end():head.end() + 1400]
+        # Excluir las hojas de continuación narrativas: en ellas no figura
+        # la lista principal con el evento 1) de forma fiable.
+        if re.match(r"[^\n]*\(Continuation", tail, re.I):
+            continue
+        tail = re.split(r"\b(?:II\.\s*SUSPECT\s+DRUG|14\.\s*SUSPECT\s+DRUG)\b",
+                        tail, maxsplit=1, flags=re.I)[0]
+        event = re.search(r"(?:^|\n)\s*1\)\s*(.+)", tail, re.I)
+        if not event:
+            continue
+        name = re.split(r"\s*\(", event.group(1), maxsplit=1)[0]
+        name = re.sub(r"\s+", " ", name).strip(" -:;,.")
+        if not (3 <= len(name) <= 160 and re.search(r"[A-Za-z]", name)):
+            continue
+        if re.search(r"(?:DESCRIBE|REACTION\(S\)|MEDDRA|VERSION)", name, re.I):
+            continue
+        # Usar capitalización consistente sin cambiar terminología médica.
+        return name if name.isupper() else name
+    return None
 
 COUNTRY_BY_ID_PREFIX = {
     "CN": "CHINA",
@@ -569,8 +457,7 @@ def heuristics(text: str) -> Dict[str, Any]:
     out["fecha_reporte"] = _extract_report_date(clean_text)
     out["tipo"] = _extract_report_type(clean_text)
     out["reporte"] = _extract_report(clean_text)
-    if not out["pais"]:
-        out["pais"] = infer_country_from_id(out["id_reporte"])
+    # No derivar el país del prefijo de ID: puede representar otra jurisdicción.
 
     out["reporte"] = clean_report_text(out["reporte"])
 
@@ -714,7 +601,12 @@ def _normalize_fields(d: Dict[str, Any]) -> Dict[str, Any]:
     return out
 VALID_COUNTRIES = {
     "CHILE", "CHINA", "ARGENTINA", "BRAZIL", "PERU",
-    "COLOMBIA", "MEXICO", "UNITED STATES", "UNITED STATES OF AMERICA"
+    "COLOMBIA", "MEXICO", "UNITED STATES", "UNITED STATES OF AMERICA",
+    "UNITED KINGDOM", "SPAIN", "BELGIUM", "AUSTRALIA", "CANADA",
+    "GERMANY", "FRANCE", "ITALY", "NETHERLANDS", "PORTUGAL",
+    "JAPAN", "INDIA", "SOUTH KOREA", "SWITZERLAND", "POLAND",
+    "AUSTRIA", "SWEDEN", "CZECH REPUBLIC", "HUNGARY", "SINGAPORE",
+    "NEW ZEALAND", "IRELAND", "TURKEY", "TAIWAN", "ISRAEL"
 }
 
 GENERIC_REPORT_TERMS = {
@@ -724,10 +616,10 @@ GENERIC_REPORT_TERMS = {
 def _is_valid_date(s: Optional[str]) -> bool:
     if not isinstance(s, str) or not s.strip():
         return False
-    return normalizar(s) is not None or bool(re.match(r"^\d{2}-[A-Z]{3}-\d{4}$", s.strip()))
+    return normalizar(s) is not None
 
 def _is_valid_pv(s: Optional[str]) -> bool:
-    return isinstance(s, str) and REPORT_ID_RE.fullmatch(s.strip()) is not None
+    return isinstance(s, str) and _valid_report_id_candidate(s)
 
 def _is_valid_type(s: Optional[str]) -> bool:
     return isinstance(s, str) and s.strip().upper() in {"INITIAL", "FOLLOWUP"}
@@ -849,6 +741,40 @@ def choose_best_result(res: Dict[str, Any]) -> Dict[str, Any]:
         "best_result": best["candidate"] if best else None,
         "ranking": ranking,
     }
+
+def choose_llm_first_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Choose among AI outputs only; heuristics never competes with a successful AI output.
+
+    Heuristics may complete genuinely absent AI fields. Explicit CIOMS evidence
+    validation is applied afterwards by the calling workflow.
+    """
+    ai_methods = ("llm_text", "llm_image", "llm_text_image")
+    ranking = []
+    for method in ai_methods:
+        candidate = res.get(method) or {}
+        if not any(candidate.get(k) not in (None, "", "null") for k in
+                   ("reporte", "id_reporte", "fecha_reporte", "pais", "tipo")):
+            continue
+        scored = score_candidate(candidate, res.get("heuristics"))
+        ranking.append({"method": method, "candidate": candidate,
+                        "score": scored["score"], "details": scored["details"]})
+    ranking.sort(key=lambda item: item["score"], reverse=True)
+    if not ranking:
+        return {"best_method": "heuristics_fallback_empty_ai",
+                "best_result": dict(res.get("heuristics") or {}),
+                "ranking": [], "filled_from_heuristics": []}
+
+    winner = ranking[0]
+    chosen = dict(winner["candidate"])
+    fallback = res.get("heuristics") or {}
+    filled = []
+    for key in ("reporte", "id_reporte", "fecha_reporte", "pais", "tipo"):
+        if chosen.get(key) in (None, "", "null") and fallback.get(key) not in (None, "", "null"):
+            chosen[key] = fallback[key]
+            filled.append(key)
+    return {"best_method": winner["method"], "best_result": chosen,
+            "ranking": ranking, "filled_from_heuristics": filled}
+
 
 def merge_best_fields(res: Dict[str, Any]) -> Dict[str, Any]:
     methods = ["heuristics", "llm_text", "llm_image", "llm_text_image"]
@@ -1099,18 +1025,31 @@ class ClaudeProvider(BaseProvider):
 # Prompt comun de extraccion
 # -------------------------
 def build_extraction_prompt() -> str:
-    #sin schema. Solo pedimos JSON y luego lo parseamos
+    """Campos CIOMS para resumen SUSAR; no confundir narrativa con casillas."""
     return (
-        "Extrae campos desde un formulario CIOMS.\n"
-        "IMPORTANTE: en este proyecto, el reporte debe ser el primero.\n"
-        "IMPORTANTE: en este proyecto, 'reporte' = el término de Reaction(s) (ej: 'Non-cardiac chest pain') solamente el sintoma no los corchetes.\n"
-        "Para el ID del reporte extrae el Worldwide, es decir, el mas completo"
-        "Devuelve SOLO un JSON válido con estas llaves EXACTAS:\n"
+        "Extrae campos exclusivamente del formulario CIOMS (no de la carta de presentación).\n"
+        "REGLA OBLIGATORIA PARA 'reporte': busca el campo 7+13 DESCRIBE REACTION(S). "
+        "Devuelve EXCLUSIVAMENTE el nombre del evento numerado 1), el PRIMER evento de esa lista. "
+        "Aunque existan 2), 3) o más eventos, ignóralos para el campo 'reporte'. "
+        "No los concatenes ni resumas la lista completa. "
+        "Ejemplo: '1) PNEUMONITIS (Pneumonitis (10035742), ...)' -> 'Pneumonitis'. "
+        "Ejemplo: '1) COLITIS ... 2) DIARRHOEA ... 3) VOMITING ...' -> 'Colitis'. "
+        "Quita '1)', códigos MedDRA, paréntesis con sinónimos, fechas y explicaciones; "
+        "conserva el término médico completo del PRIMER evento, sin traducirlo.\n"
+        "Para 'tipo', observa visualmente la sección 25a. REPORT TYPE: "
+        "el valor es SOLO la casilla efectivamente marcada junto a INITIAL o FOLLOWUP. "
+        "La mera aparición de las palabras no significa que estén marcadas. "
+        "No deduzcas el tipo por la narrativa ('initial report', 'follow-up report #1'), "
+        "la numeración del caso, el nombre del archivo ni las cartas de presentación. "
+        "Si no puedes ver con claridad cuál casilla está marcada, devuelve null.\n"
+        "Para 'id_reporte', prioriza 24b. MFR CONTROL NO o un Worldwide UID explícito "
+        "del reporte, sin direcciones, códigos postales ni IDs ajenos.\n"
+        "El país es el de 1a. COUNTRY (paciente), NUNCA el de la dirección del fabricante.\n"
+        "La fecha es DATE OF THIS REPORT, NO DATE RECEIVED ni fechas clínicas.\n"
+        "No devuelvas encabezados como valores. Devuelve SOLO un JSON válido con las llaves EXACTAS:\n"
         '  {"reporte": ..., "id_reporte": ..., "fecha_reporte": ..., "pais": ..., "tipo": ...}\n'
-        "Reglas:\n"
-        "- Si no aparece un campo, usa null.\n"
-        "- 'tipo' solo puede ser 'INITIAL' o 'FOLLOWUP' o null.\n"
-        "- 'fecha_reporte' idealmente en formato DD-MMM-YYYY (ej 04-DEC-2025) si la ves.\n"
+        "Si falta evidencia fiable, usa null. 'tipo' solo admite 'INITIAL', 'FOLLOWUP' o null. "
+        "Normaliza la fecha a DD-MMM-YYYY cuando sea posible.\n"
     )
 
 def provider_factory(name: str, model_text: str, model_vision: str) -> BaseProvider:
@@ -1136,6 +1075,218 @@ def classify_ai_error(exc: Exception) -> str:
     if "401" in msg or "api key" in msg:
         return "AUTH_ERROR"
     return "OPENAI_ERROR"
+
+
+# Verificacion documental independiente de IA: solo campos explicitamente rotulados.
+# Se aplica a PDFs con texto seleccionable; si no hay evidencia, no se inventan datos.
+def _first_reaction_from_cioms(page_text: str) -> Optional[str]:
+    """Lee SOLO el evento 1) de la primera sección 7+13, sin otros eventos."""
+    match = re.search(r"7\s*\+\s*13\s*DESCRIBE\s+REACTION\(S\)", page_text, re.I)
+    if not match:
+        return None
+    tail = page_text[match.end():]
+    # Limitarse al bloque de reacciones, nunca tomar numeraciones de fármacos.
+    tail = re.split(r"\bII\.\s*SUSPECT\s+DRUG|\b14\.\s*SUSPECT\s+DRUG", tail, maxsplit=1, flags=re.I)[0]
+    for line in tail.splitlines()[:35]:
+        item = re.match(r"^\s*1\)\s+(.+)$", line.strip())
+        if not item:
+            continue
+        raw = item.group(1).strip()
+        # El primer paréntesis contiene los sinónimos/códigos MedDRA.
+        first = re.split(r"\s+\(", raw, maxsplit=1)[0].strip(" -:;,.\t")
+        if not first or len(first) > 160 or re.search(r"DESCRIBE REACTION|MEDDRA VERSION", first, re.I):
+            return None
+        if first.isupper() and len(first) > 4:
+            # Mantener los acrónimos clínicos conocidos en mayúscula.
+            keep = {"HIV", "COVID-19", "ARDS", "ALT", "AST", "SARS", "ECG"}
+            first = " ".join(x if x in keep else (x[0].upper() + x[1:].lower() if x else x)
+                             for x in first.split())
+        return first
+    return None
+
+
+def _cioms_visual_checkbox_type(page) -> Optional[Dict[str, Any]]:
+    """Detecta tinta *dentro* de la casilla junto a INITIAL/FOLLOWUP.
+
+    Solo evalúa el campo 25a del CIOMS usando las posiciones del PDF y píxeles.
+    Si no podemos localizar las dos casillas, no inventamos un tipo.
+    """
+    text = page.get_text("text")
+    if not re.search(r"25a\.\s*REPORT\s+TYPE", text, re.I):
+        return None
+    words = page.get_text("words")
+    anchors = [w for w in words if re.fullmatch(r"25a\.?", w[4], re.I)]
+    if not anchors:
+        return None
+    anchor = anchors[0]
+    options = {}
+    for name in ("INITIAL", "FOLLOWUP"):
+        eligible = [w for w in words if w[4].strip(".,:").upper() == name
+                    and 0 < w[1] - anchor[1] < 44
+                    and abs(w[1] - anchor[1]) < 44
+                    and abs(w[0] - anchor[0]) < 190]
+        if eligible:
+            options[name] = min(eligible, key=lambda w: abs(w[1] - anchor[1]))
+    if len(options) != 2 or abs(options["INITIAL"][1] - options["FOLLOWUP"][1]) > 6:
+        return None
+
+    def ink_ratios(dx0, dy0, dx1, dy1, inset_box):
+        scores = {}
+        for name, word in options.items():
+            x, y = word[0], word[1]
+            clip = page.rect & __import__("fitz").Rect(x + dx0, y + dy0, x + dx1, y + dy1)
+            if clip.is_empty or clip.width < 10 or clip.height < 12:
+                return None
+            pix = page.get_pixmap(matrix=__import__("fitz").Matrix(4, 4), clip=clip, alpha=False)
+            raster = Image.frombytes("RGB", (pix.width, pix.height), pix.samples).convert("L")
+            inset = raster.crop(inset_box)
+            if inset.width < 20 or inset.height < 20:
+                return None
+            gray = inset.tobytes()
+            scores[name] = sum(v < 160 for v in gray) / len(gray)
+        return scores
+
+    # Dos geometrías documentadas: cuadrado 11-12pt con check y 9pt con X.
+    layouts = ((-14, -6, -1, 9, (14, 14, 44, 43), 0.09, 0.08),
+               (-18, -2, -4, 12, (14, 12, 46, 44), 0.22, 0.14))
+    for dx0, dy0, dx1, dy1, inset, minimum_ink, min_diff in layouts:
+        scores = ink_ratios(dx0, dy0, dx1, dy1, inset)
+        if not scores:
+            continue
+        marked = max(scores, key=scores.get)
+        other = "INITIAL" if marked == "FOLLOWUP" else "FOLLOWUP"
+        if scores[marked] > minimum_ink and scores[marked] - scores[other] > min_diff:
+            return {"value": marked, "source": "cioms_checkbox_visual",
+                    "confidence": "high", "checkbox_scores": {k: round(v, 3) for k, v in scores.items()}}
+    return {"value": None, "source": "cioms_checkbox_ambiguous", "confidence": "uncertain"}
+
+
+def _cioms_country_from_page(page_text: str) -> Optional[str]:
+    """País del campo explícito 1a, nunca una dirección o inferencia.
+
+    Devuelve None cuando el valor es una palabra cortada o un indicador de
+    continuación. La búsqueda en hojas siguientes ocurre por separado.
+    """
+    match = re.search(r"(?:^|\n)1a\.\s*COUNTRY\s*(?:\n|:\s*)([^\n]+)", page_text, re.I)
+    if not match:
+        return None
+    country = re.sub(r"\s+", " ", match.group(1)).strip().upper()
+    country = country.split(" - ")[0].strip()
+    if (not (2 <= len(country) <= 85)
+            or not re.fullmatch(r"[A-ZÀ-Ÿ .'-]+", country)
+            or re.search(r"DESCRIBE|REACTION|MANUFACTURER|PATIENT|UNKNOWN|MASKED|\bCONT\b", country, re.I)
+            or country in {"UNITED", "U.S.", "CONT..", "CONT."}):
+        return None
+    if country == "UNITED KINGDOM OF GREAT BRITAIN AND NORTHERN IRELAND":
+        return "UNITED KINGDOM"
+    return country
+
+
+def _cioms_continuation_same_report(page_text: str, main_report_id: Optional[str]) -> bool:
+    """Acepta solo hojas CIOMS de continuación del mismo control de reporte."""
+    if not re.search(r"CIOMS\s+FORM", page_text, re.I):
+        return False
+    if not re.search(r"CONTINUATION\s+SHEET\s+FOR\s+CIOMS\s+REPORT", page_text, re.I):
+        return False
+    header = re.search(r"Mfr\.?\s*CONTROL\s+NO\s*:?\s*([A-Z0-9()/_-]{6,75})", page_text, re.I)
+    if header and main_report_id and header.group(1).upper() != main_report_id.upper():
+        return False
+    return True
+
+
+def extract_cioms_evidence(pdf_path: str) -> Dict[str, Any]:
+    evidence = {}
+    try:
+        import fitz
+        with fitz.open(pdf_path) as document:
+            main_page_index = None
+            # Extraer los demás campos únicamente de la hoja principal del CIOMS.
+            for page_number in range(min(len(document), 12)):
+                page_text = document[page_number].get_text("text", sort=False)
+                if not page_text or not re.search(r"CIOMS\s+FORM", page_text, re.I):
+                    continue
+                if not re.search(r"1a\.\s*COUNTRY|24b\.\s*MFR", page_text, re.I):
+                    continue
+                if re.search(r"CONTINUATION\s+SHEET\s+FOR\s+CIOMS\s+REPORT", page_text, re.I):
+                    continue
+                main_page_index = page_number
+                first_reaction = _first_reaction_from_cioms(page_text)
+                if first_reaction:
+                    evidence["reporte"] = {"value": first_reaction, "page": page_number + 1,
+                                           "source": "cioms_first_reaction"}
+                checkbox = _cioms_visual_checkbox_type(document[page_number])
+                if checkbox is not None:
+                    evidence["tipo"] = {**checkbox, "page": page_number + 1}
+                lines = [re.sub(r"\s+", " ", x).strip() for x in page_text.splitlines() if x.strip()]
+                joined = "\n".join(lines)
+                patterns = {
+                    "fecha_reporte": r"DATE\s+OF\s+THIS\s+REPORT\s*(?:\n|:\s*)(\d{1,2}[/\-][A-Za-z]{3,9}[/\-]\d{4}|\d{1,2}[/\-]\d{1,2}[/\-]\d{4})",
+                    "id_reporte": r"24b\.\s*MFR\s+CONTROL\s+NO\.?\s*(?:\n|:\s*)([^\n]+)",
+                }
+                for field, pattern in patterns.items():
+                    match = re.search(pattern, joined, re.I)
+                    if not match:
+                        continue
+                    raw = match.group(1).strip()
+                    if field == "fecha_reporte":
+                        raw = normalizar(raw)
+                        if not raw:
+                            continue
+                    elif field == "id_reporte":
+                        raw = raw.upper()
+                        if not re.fullmatch(r"[A-Z0-9][A-Z0-9()/_\-]{5,75}", raw):
+                            continue
+                    evidence[field] = {"value": raw, "page": page_number + 1,
+                                       "source": "cioms_labeled_field"}
+                main_country = _cioms_country_from_page(joined)
+                if main_country:
+                    evidence["pais"] = {"value": main_country, "page": page_number + 1,
+                                        "source": "cioms_labeled_field"}
+                break
+
+            # Los campos 1a a veces muestran UNITED + Cont.. en la hoja principal.
+            # Buscar el valor COMPLETO en la continuación del MISMO reporte, sin
+            # modificar fechas/IDs/eventos, ni tomar la dirección del fabricante.
+            if main_page_index is not None and not evidence.get("pais"):
+                main_id = (evidence.get("id_reporte") or {}).get("value")
+                for page_number in range(main_page_index + 1, min(len(document), main_page_index + 11)):
+                    text = document[page_number].get_text("text", sort=False)
+                    if not _cioms_continuation_same_report(text, main_id):
+                        continue
+                    country = _cioms_country_from_page(text)
+                    if country:
+                        evidence["pais"] = {"value": country, "page": page_number + 1,
+                                            "source": "cioms_country_continuation"}
+                        break
+    except Exception as exc:
+        # La validación independiente no bloquea el fallback histórico.
+        evidence["_error"] = type(exc).__name__
+    return evidence
+
+
+def validate_selected_with_evidence(result: Dict[str, Any], evidence: Dict[str, Any]) -> Tuple[Dict[str, Any], list]:
+    result = dict(result or {})
+    changes = []
+    for field in ("pais", "fecha_reporte", "id_reporte", "reporte", "tipo"):
+        item = evidence.get(field)
+        if not isinstance(item, dict):
+            continue
+        canonical = item["value"]
+        current = result.get(field)
+        # Para tipo visual ambiguo, dejar en blanco; no fabricar INITIAL/FOLLOWUP.
+        if field == "tipo" and canonical is None and current is None:
+            continue
+        if (current or None) != (canonical or None) and (not current or str(current).strip().upper() != str(canonical).strip().upper()):
+            changes.append({"field": field, "previous": current, "corrected": canonical,
+                            "source": item["source"], "page": item["page"]})
+            result[field] = canonical
+    # Rechazar paises incompletos, aunque procedan del OCR o de la IA.
+    country = str(result.get("pais") or "").strip().upper()
+    if country in {"UNITED", "U.S."}:
+        changes.append({"field": "pais", "previous": result.get("pais"),
+                        "corrected": None, "source": "invalid_incomplete_country", "page": None})
+        result["pais"] = None
+    return result, changes
 
 
 def procesar_archivo_con_ia(
@@ -1171,6 +1322,8 @@ def procesar_archivo_con_ia(
     images = load_images_from_input(input_path, max_pages=max_pages, dpi=dpi)
     ocr_text, ocr_status = try_ocr_multi(images, max_pages_ocr=min(3, len(images)))
     heuristic_result = heuristics(ocr_text or "")
+    cioms_evidence = extract_cioms_evidence(input_path)
+    heuristic_result, heuristic_corrections = validate_selected_with_evidence(heuristic_result, cioms_evidence)
 
     res = {
         "input": input_path,
@@ -1180,6 +1333,8 @@ def procesar_archivo_con_ia(
         "ocr_status": ocr_status,
         "ocr_preview": (ocr_text[:600] + "...") if ocr_text and len(ocr_text) > 600 else ocr_text,
         "heuristics": heuristic_result,
+        "cioms_evidence": cioms_evidence,
+        "field_corrections": heuristic_corrections[:],
         "llm_text": None,
         "llm_image": None,
         "llm_text_image": None,
@@ -1204,7 +1359,11 @@ def procesar_archivo_con_ia(
         )
 
         if ocr_text:
-            raw = provider_client.text_only(prompt + "\n\nTEXTO OCR:\n" + ocr_text)
+            raw = provider_client.text_only(
+                prompt + "\nMODO SOLO TEXTO: las casillas marcadas no se identifican "
+                "de forma fiable en OCR. Para 'tipo', devuelve null; nunca lo infieras de la narrativa.\n"
+                + "\n\nTEXTO OCR:\n" + ocr_text
+            )
             res["llm_text"] = _normalize_fields(_extract_json_object(raw))
         else:
             res["llm_text"] = {
@@ -1227,16 +1386,21 @@ def procesar_archivo_con_ia(
         return res
 
     # Solo se conserva la selección original si todas las llamadas de IA terminaron bien.
-    selection = choose_best_result(res)
+    selection = choose_llm_first_result(res) if provider == "openai" else choose_best_result(res)
     res["best_method"] = selection["best_method"]
     res["best_result"] = selection["best_result"]
     res["ranking"] = selection["ranking"]
+    res["filled_from_heuristics"] = selection.get("filled_from_heuristics", [])
 
     merged = merge_best_fields(res)
     res["merged_result"] = merged["merged_result"]
     res["merged_from"] = merged["merged_from"]
 
     res.update(build_selected_payload(res, result_view))
+    # Default API view is 'best'. Explicit alternate result views remain available
+    # for CLI/debugging, without changing the client-facing JSON schema.
+    res["selected_result"], corrections = validate_selected_with_evidence(res.get("selected_result"), cioms_evidence)
+    res["field_corrections"].extend(corrections)
     res["ai_status"] = "success"
     return res
 
